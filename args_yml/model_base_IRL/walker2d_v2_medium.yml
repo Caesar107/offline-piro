@@ -31,4 +31,4 @@ args:
     load_model_dir: world_model/model_walker2d/walker2d-med/checkpoints/model_saved_weights/Model_walker2d-medium-v2_seed0_2022_11_28_14-27-54
     train_memory: 1000000
     val_memory: 500000
-    transfer: True
+    transfer: False

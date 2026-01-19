@@ -18,7 +18,7 @@ import random
 import copy
 
 from trainer import Trainer, reward_estimator
-from utils import Transition, check_or_make_folder
+from utils import Transition, check_or_make_folder, ReplayPool
 import d4rl
 import pickle
 import pandas as pd
@@ -63,10 +63,11 @@ class OfflinePiroTrainer(Trainer):
         self.reward_lr = params.get('piro_reward_lr', 3e-4)
         self.reward_hidden_sizes = params.get('piro_reward_hidden', [256, 256])
         
-        # Initialize reward function
+        # Initialize reward function (using state-action pair, same as ML-IRL)
         state_dim = env.observation_space.shape[0]
+        action_dim = env.action_space.shape[0]
         self.reward_func = reward_estimator(
-            input_dim=state_dim,
+            input_dim=state_dim + action_dim,  # state-action pair
             hidden_sizes=self.reward_hidden_sizes,
             device=device
         ).to(device)
@@ -222,6 +223,34 @@ class OfflinePiroTrainer(Trainer):
             actions_batch = np.random.randn(batch_size, act_shape)
             return states_batch, actions_batch
     
+    def sample_expert_initial_states(self, num_states=50):
+        """
+        Sample initial states from expert trajectories (first state of each trajectory)
+        Used for model rollout to collect agent samples
+        """
+        try:
+            # Load expert data (使用绝对路径)
+            expert_path = self._get_expert_data_path()
+            expert_states = np.load(os.path.join(expert_path, 'states.npy'))[:50]
+            
+            # expert_states shape: (num_traj, traj_length, state_dim)
+            # Take first state of each trajectory
+            initial_states = expert_states[:, 0, :]  # (num_traj, state_dim)
+            
+            # Sample if we need fewer states
+            if len(initial_states) > num_states:
+                indices = np.random.choice(len(initial_states), num_states, replace=False)
+                initial_states = initial_states[indices]
+            
+            return torch.FloatTensor(initial_states).to(device)
+            
+        except FileNotFoundError:
+            print("Warning: Expert data not found, using random initial states")
+            # Fallback to random initial states
+            obs_shape = self.model.observation_space.shape[0]
+            initial_states = np.random.randn(num_states, obs_shape)
+            return torch.FloatTensor(initial_states).to(device)
+    
     def estimate_reward_gradient(self, expert_batch, model_transitions):
         """
         Estimate gradient of L_θ_old(θ) using expert batch and model transitions
@@ -256,9 +285,10 @@ class OfflinePiroTrainer(Trainer):
         
         return reward_loss
     
-    def update_reward_with_constraints(self, agent_samples, expert_samples):
+    def update_reward_with_constraints(self, agent_samples, expert_states, expert_actions):
         """
         Update reward with trust region constraints based on irl_samples.py approach
+        Now uses state-action pair (same as ML-IRL)
         """
         # Store current reward as old for next iteration if first time
         if self.old_reward_func is None:
@@ -271,19 +301,26 @@ class OfflinePiroTrainer(Trainer):
         # Copy current weights to old network
         self.old_reward_func.load_state_dict(self.reward_func.state_dict())
         
-        # Convert samples to tensors
+        # Extract agent states and actions from samples
         if isinstance(agent_samples, list):
             agent_states = np.concatenate([t.state.reshape(1, -1) for t in agent_samples], axis=0)
+            agent_actions = np.concatenate([t.action.reshape(1, -1) for t in agent_samples], axis=0)
         else:
+            # If agent_samples is already processed (unlikely in current code)
             agent_states = agent_samples.reshape(-1, agent_samples.shape[-1])
+            agent_actions = np.zeros((agent_states.shape[0], self.agent.action_dim))  # Placeholder
             
-        agent_states_tensor = torch.FloatTensor(agent_states).to(device)
-        expert_states_tensor = torch.FloatTensor(expert_samples).to(device)
+        # Concatenate state and action (same as ML-IRL)
+        agent_state_action = np.concatenate([agent_states, agent_actions], axis=1)
+        expert_state_action = np.concatenate([expert_states, expert_actions], axis=1)
+        
+        agent_state_action_tensor = torch.FloatTensor(agent_state_action).to(device)
+        expert_state_action_tensor = torch.FloatTensor(expert_state_action).to(device)
         
         # Calculate current and old rewards
-        current_rewards = self.reward_func(agent_states_tensor).view(-1)
-        old_rewards = self.old_reward_func(agent_states_tensor).view(-1)
-        expert_rewards = self.reward_func(expert_states_tensor).view(-1)
+        current_rewards = self.reward_func(agent_state_action_tensor).view(-1)
+        old_rewards = self.old_reward_func(agent_state_action_tensor).view(-1)
+        expert_rewards = self.reward_func(expert_state_action_tensor).view(-1)
         
         # Calculate reward difference for constraint
         reward_diff = current_rewards - old_rewards
@@ -435,26 +472,63 @@ class OfflinePiroTrainer(Trainer):
                 # Sample expert batch
                 expert_states, expert_actions = self.sample_expert_batch()
                 
-                # Collect agent samples from current policy
-                agent_samples = []
-                for _ in range(50):  # Collect some agent trajectories
-                    state = self.model.real_env.reset()
-                    for step in range(20):  # Short trajectories
-                        action = self.agent.get_action(state, deterministic=False)
-                        next_state, reward, done, _ = self.model.real_env.step(action)
-                        agent_samples.append(Transition(state, action, reward, next_state, done))
-                        state = next_state
-                        if done:
-                            break
+                # Collect agent samples from current policy using world model rollout
+                # (Same approach as ML-IRL: use model rollout instead of real environment)
+                sample_pool = ReplayPool(capacity=1e6)
+                
+                # Sample initial states from expert trajectories
+                init_states = self.sample_expert_initial_states(num_states=50)
+                
+                # Rollout current policy in world model (like ML-IRL's _rollout_model_expert)
+                self._rollout_model_expert(init_states, sample_pool, IRL=True, Penalty_only=True)
+                
+                # Extract agent samples from rollout pool (same format as ML-IRL)
+                samples = sample_pool.sample_all()
+                if len(samples.state) > 0:
+                    # Flatten nested structure like ML-IRL does
+                    # samples.state is a tuple/list of arrays, each array may contain multiple states
+                    agent_samples = []
+                    for i in range(len(samples.state)):
+                        state_arr = samples.state[i]
+                        action_arr = samples.action[i]
+                        nextstate_arr = samples.nextstate[i]
+                        done_arr = samples.real_done[i]  # Transition uses 'real_done' not 'done'
+                        
+                        # Handle both single transitions and arrays of transitions
+                        if isinstance(state_arr, np.ndarray):
+                            if len(state_arr.shape) == 1:
+                                # Single transition (1D array)
+                                agent_samples.append(Transition(
+                                    state_arr, action_arr, 0.0, nextstate_arr, done_arr
+                                ))
+                            else:
+                                # Multiple transitions (2D array: shape [num_transitions, state_dim])
+                                num_trans = state_arr.shape[0]
+                                for t in range(num_trans):
+                                    agent_samples.append(Transition(
+                                        state_arr[t], action_arr[t] if len(action_arr.shape) > 1 else action_arr,
+                                        0.0, nextstate_arr[t] if len(nextstate_arr.shape) > 1 else nextstate_arr,
+                                        done_arr[t] if isinstance(done_arr, np.ndarray) and len(done_arr.shape) > 0 else done_arr
+                                    ))
+                        else:
+                            # Single scalar/1D array
+                            agent_samples.append(Transition(
+                                np.array(state_arr), np.array(action_arr), 0.0,
+                                np.array(nextstate_arr), done_arr
+                            ))
+                else:
+                    agent_samples = []
                 
                 # Update reward with constraints (using irl_samples.py approach)
                 if len(agent_samples) > 0:
                     loss, base_loss, avg_diff, l2_norm = self.update_reward_with_constraints(
-                        agent_samples, expert_states)
+                        agent_samples, expert_states, expert_actions)
                     
                     if j == 0:  # 只打印第一次
                         print(f"  Reward update: loss={loss:.4f}, base={base_loss:.4f}, "
                               f"avg_diff={avg_diff:.4f}, l2_norm={l2_norm:.4f}")
+                else:
+                    print(f"  Warning: No agent samples collected in reward update round {j+1}")
         
         # Save final models
         if save_policy:

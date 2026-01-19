@@ -5,7 +5,7 @@ args:
     reward_head: True
     logvar_head: True
     states: 'uniform'
-    steps_k: 43
+    steps_k: 6
     reward_steps: 200
     num_rollouts_per_step: 50
     policy_update_steps: 1000
@@ -20,8 +20,9 @@ args:
     d4rl: True
     model_retain_epochs: 5
     mopo: True
-    mopo_lam: 37.28
-    mopo_penalty_type: ensemble_std
+    #mopo_lam: 5.92
+    mopo_lam: 5.92
+    mopo_penalty_type: ensemble_var
     offline_epochs: 1000
     save_model: True
     save_policy: True
