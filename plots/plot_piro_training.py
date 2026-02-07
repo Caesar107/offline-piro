@@ -190,7 +190,7 @@ def plot_comparison(piro_csv, mlirl_csv, save_dir=None):
 
 if __name__ == "__main__":
     # 默认路径
-    default_csv = "/home/ssd/zml/offline-TRRL/data/halfcheetah_piro_result/halfcheetah-medium-v2_0_piro_offline.csv"
+    default_csv = "E:\code\offline-piro\data\hopper_medexp42\hopper-medium-expert-v2_42_piro_offline.csv"
     
     if len(sys.argv) > 1:
         csv_path = sys.argv[1]

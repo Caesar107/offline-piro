@@ -62,6 +62,7 @@ class OfflinePiroTrainer(Trainer):
         # Reward function parameters
         self.reward_lr = params.get('piro_reward_lr', 3e-4)
         self.reward_hidden_sizes = params.get('piro_reward_hidden', [256, 256])
+        self.reward_update_every = params.get('piro_reward_update_every', 20)
         
         # Initialize reward function (using state-action pair, same as ML-IRL)
         state_dim = env.observation_space.shape[0]
@@ -84,6 +85,20 @@ class OfflinePiroTrainer(Trainer):
         print(f"  Policy rounds per loop (k): {self.k}")  
         print(f"  Reward rounds per loop (n): {self.n}")
         print(f"  L2 constraint target: {self.target_reward_l2_norm}")
+
+    def _train_agent(self, IRL=False):
+        if self._augment_offline_data:
+            print("Augmenting model data with RAD")
+        if IRL:
+            self.agent.optimize(
+                n_updates=self._policy_update_steps,
+                env_pool=self.model.model.memory,
+                env_ratio=self._real_sample_ratio,
+                augment_data=self._augment_offline_data,
+                reward_function=self.reward_func,
+            )
+        else:
+            super()._train_agent(IRL=False)
         
     def _get_expert_folder(self):
         """
@@ -297,9 +312,8 @@ class OfflinePiroTrainer(Trainer):
                 hidden_sizes=self.reward_hidden_sizes,
                 device=device
             ).to(device)
-        
-        # Copy current weights to old network
-        self.old_reward_func.load_state_dict(self.reward_func.state_dict())
+            # Initialize old reward for the first update
+            self.old_reward_func.load_state_dict(self.reward_func.state_dict())
         
         # Extract agent states and actions from samples
         if isinstance(agent_samples, list):
@@ -325,8 +339,8 @@ class OfflinePiroTrainer(Trainer):
         # Calculate reward difference for constraint
         reward_diff = current_rewards - old_rewards
         
-        # Original ML-IRL loss: E_expert[r] - E_agent[r] 
-        base_loss = expert_rewards.mean() - current_rewards.mean()
+        # Original ML-IRL loss: E_agent[r] - E_expert[r]
+        base_loss = current_rewards.mean() - expert_rewards.mean()
         
         # Calculate constraint terms (from irl_samples.py)
         avg_reward_diff = torch.mean(reward_diff)
@@ -356,6 +370,9 @@ class OfflinePiroTrainer(Trainer):
         self.reward_optimizer.zero_grad()
         loss.backward()
         self.reward_optimizer.step()
+
+        # Store current reward as old for the next update step
+        self.old_reward_func.load_state_dict(self.reward_func.state_dict())
         
         return loss.item(), base_loss.item(), avg_reward_diff.item(), l2_norm_reward_diff.item()
     
@@ -412,12 +429,10 @@ class OfflinePiroTrainer(Trainer):
             # Step 1: k rounds of SAC based on current reward function
             print(f"Training policy for {self.k} rounds...")
             for k_round in range(self.k):
-                # Set agent's reward function to current learned reward
-                self.agent.reward_function = lambda states: self.reward_func(
-                    torch.FloatTensor(states).to(device)
-                ).detach().cpu().numpy()
-                
-                # Train SAC agent 
+                # Rollout in model with MOPO penalty-only rewards
+                self._rollout_model(Penalty_only=True)
+
+                # Train SAC agent
                 self._train_agent(IRL=True)
                 
                 # ========== 每个 policy round 后评估和保存（和 ML-IRL 对齐）==========
@@ -466,7 +481,11 @@ class OfflinePiroTrainer(Trainer):
                         rew=int(reward_actual_stats.mean())
                     )
             
-            # Step 2: n rounds of reward updates with constraints
+            # Step 2: n rounds of reward updates with constraints (throttled)
+            if self.reward_update_every > 0 and (equiv_epoch % self.reward_update_every != 0):
+                print(f"Skipping reward update (every {self.reward_update_every} epochs)")
+                continue
+
             print(f"Updating reward function for {self.n} rounds...")
             for j in range(self.n):
                 # Sample expert batch

@@ -50,12 +50,13 @@ def train_agent_piro(params, online_yaml_config):
     eval_env = gym.make(params['env_name'])
     eval_env = TimeLimit(eval_env, max_episode_steps=1000)
     
-    # Set done function
-    if 'Hopper' in params['env_name']:
+    # Set done function (match train_agent_new behavior)
+    env_name_lower = params['env_name'].lower()
+    if 'hopper' in env_name_lower:
         params['is_done_func'] = hopper_is_done_func
-    elif 'Walker' in params['env_name']:
+    elif 'walker' in env_name_lower:
         params['is_done_func'] = walker2d_is_done_func
-    elif 'Ant' in params['env_name']:
+    elif 'ant' in env_name_lower:
         params['is_done_func'] = ant_is_done_func
     else:
         params['is_done_func'] = None
@@ -307,6 +308,8 @@ def main():
                         help='Policy update rounds (k) per outer loop')
     parser.add_argument('--piro_reward_rounds', type=int, default=3,
                         help='Reward update rounds (n) per outer loop')
+    parser.add_argument('--piro_reward_update_every', type=int, default=20,
+                        help='Reward update frequency in equivalent epochs')
     
     parser.set_defaults(fix_std=False)
     parser.set_defaults(model_free=False)
